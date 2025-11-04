@@ -1,0 +1,126 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vecina-transcriber"
+version = "0.1.0"
+description = "A podcast transcription tool that downloads episodes from Apple Podcasts and Spotify, then transcribes them using Whisper"
+readme = "README.md"
+license = {file = "LICENSE"}
+authors = [
+    {name = "VECINA Team"}
+]
+keywords = ["podcast", "transcription", "whisper", "spotify", "apple-podcasts"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+requires-python = ">=3.8"
+dependencies = [
+    "openai-whisper>=20231117",
+    "requests>=2.25.0",
+    "spotipy>=2.20.0",
+    "feedparser>=6.0.0",
+    "click>=8.0.0",
+    "pydub>=0.25.0",
+    "youtube-dl>=2021.12.17",
+    "yt-dlp>=2023.1.6",
+    "beautifulsoup4>=4.9.0",
+    "lxml>=4.6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=6.0",
+    "pytest-cov>=2.10",
+    "black>=21.0",
+    "isort>=5.0",
+    "flake8>=3.8",
+    "mypy>=0.910",
+]
+modal = [
+    "modal>=0.55.0",
+]
+all = [
+    "modal>=0.55.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/joseph-c-mcguire/VECINA-podcast-transcription"
+Repository = "https://github.com/joseph-c-mcguire/VECINA-podcast-transcription.git"
+Issues = "https://github.com/joseph-c-mcguire/VECINA-podcast-transcription/issues"
+
+[project.scripts]
+vecina-transcriber = "vecina_transcriber.cli:main"
+
+[tool.setuptools]
+packages = ["vecina_transcriber"]
+
+[tool.setuptools.package-data]
+vecina_transcriber = ["py.typed"]
+
+[tool.black]
+line-length = 88
+target-version = ['py38']
+include = '\.pyi?$'
+extend-exclude = '''
+/(
+  # directories
+  \.eggs
+  | \.git
+  | \.hg
+  | \.mypy_cache
+  | \.tox
+  | \.venv
+  | build
+  | dist
+)/
+'''
+
+[tool.isort]
+profile = "black"
+multi_line_output = 3
+line_length = 88
+known_first_party = ["vecina_transcriber"]
+
+[tool.mypy]
+python_version = "3.8"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+disallow_untyped_decorators = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+warn_unreachable = true
+strict_equality = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py", "*_test.py"]
+addopts = "-v --cov=vecina_transcriber --cov-report=term-missing"
+
+[tool.coverage.run]
+source = ["vecina_transcriber"]
+omit = ["*/tests/*"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise AssertionError",
+    "raise NotImplementedError",
+]
