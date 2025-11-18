@@ -96,6 +96,21 @@ def cli(verbose: bool) -> None:
     default=-1.0,
     help='Threshold for detecting low-confidence segments'
 )
+@click.option(
+    '--chunk-duration',
+    type=int,
+    help='Split audio into chunks of this duration (seconds) for better accuracy on long files'
+)
+@click.option(
+    '--filter-hallucinations/--no-filter-hallucinations',
+    default=True,
+    help='Filter out hallucinated/repetitive segments (enabled by default)'
+)
+@click.option(
+    '--retry-hallucinations',
+    is_flag=True,
+    help='Retry transcribing hallucinated segments with different parameters before removing them'
+)
 def transcribe(
     audio_file: Path,
     model: str,
@@ -108,7 +123,10 @@ def transcribe(
     language: str,
     no_speech_threshold: float,
     compression_ratio_threshold: float,
-    logprob_threshold: float
+    logprob_threshold: float,
+    chunk_duration: Optional[int],
+    filter_hallucinations: bool,
+    retry_hallucinations: bool
 ) -> None:
     """Transcribe an audio file using Whisper."""
     try:
@@ -124,18 +142,38 @@ def transcribe(
             device=device_name
         )
 
-        # Transcribe the audio
-        result = transcriber.transcribe(
-            audio=audio_file,
-            temperature=temperature,
-            initial_prompt=initial_prompt,
-            word_timestamps=word_timestamps,
-            language=language,
-            no_speech_threshold=no_speech_threshold,
-            compression_ratio_threshold=compression_ratio_threshold,
-            logprob_threshold=logprob_threshold,
-            verbose=True
-        )
+        # Transcribe the audio (chunked or standard)
+        if chunk_duration:
+            logger.info(
+                f"Using chunked transcription with {chunk_duration}s chunks")
+            result = transcriber.transcribe_chunked(
+                audio=audio_file,
+                chunk_duration_seconds=chunk_duration,
+                filter_hallucinations=filter_hallucinations,
+                retry_hallucinations=retry_hallucinations,
+                temperature=temperature,
+                initial_prompt=initial_prompt,
+                word_timestamps=word_timestamps,
+                language=language,
+                no_speech_threshold=no_speech_threshold,
+                compression_ratio_threshold=compression_ratio_threshold,
+                logprob_threshold=logprob_threshold,
+                verbose=True
+            )
+        else:
+            result = transcriber.transcribe(
+                audio=audio_file,
+                filter_hallucinations=filter_hallucinations,
+                retry_hallucinations=retry_hallucinations,
+                temperature=temperature,
+                initial_prompt=initial_prompt,
+                word_timestamps=word_timestamps,
+                language=language,
+                no_speech_threshold=no_speech_threshold,
+                compression_ratio_threshold=compression_ratio_threshold,
+                logprob_threshold=logprob_threshold,
+                verbose=True
+            )
 
         # Generate output filename if not provided
         if output is None:
@@ -154,9 +192,185 @@ def transcribe(
         click.echo(f"🤖 Model: {model}")
         click.echo(f"📝 Text length: {len(result['text'])} characters")
         click.echo(f"⏱️  Segments: {len(result['segments'])}")
+        if chunk_duration:
+            click.echo(
+                f"🧩 Chunks: {result.get('num_chunks', 0)} ({chunk_duration}s each)")
+
+        # Show hallucination filter stats if available
+        if 'hallucination_filter' in result and filter_hallucinations:
+            filter_info = result['hallucination_filter']
+            removed = filter_info.get('removed_segment_count', 0)
+            retried = filter_info.get('retried_segment_count', 0)
+            if retried > 0:
+                click.echo(f"🔄 Retried {retried} hallucinated segments")
+            if removed > 0:
+                click.echo(f"🗑️  Removed {removed} hallucinated segments")
+            if removed == 0 and retried == 0:
+                click.echo(f"🔍 No hallucinations detected")
 
     except Exception as e:
         logger.error(f"Transcription failed: {e}")
+        click.echo(f"❌ Error: {e}", err=True)
+        sys.exit(1)
+
+
+@cli.command()
+@click.argument('input_dir', type=click.Path(exists=True, path_type=Path))
+@click.option(
+    '--output-dir', '-o',
+    type=click.Path(path_type=Path),
+    help='Output directory for transcriptions'
+)
+@click.option(
+    '--model', '-m',
+    default='base',
+    type=click.Choice(['tiny', 'base', 'small', 'medium',
+                      'large', 'large-v2', 'large-v3']),
+    help='Whisper model to use for transcription'
+)
+@click.option(
+    '--format', '-f',
+    type=click.Choice(['text', 'json', 'both']),
+    default='both',
+    help='Output format(s)'
+)
+@click.option(
+    '--chunk-duration',
+    type=int,
+    help='Split audio into chunks of this duration (seconds) for better accuracy'
+)
+@click.option(
+    '--filter-hallucinations/--no-filter-hallucinations',
+    default=True,
+    help='Filter out hallucinated/repetitive segments'
+)
+@click.option(
+    '--retry-hallucinations',
+    is_flag=True,
+    help='Retry transcribing hallucinated segments before removing them'
+)
+@click.option(
+    '--pattern',
+    default='*.mp3',
+    help='File pattern to match (e.g., "*.mp3", "*.wav")'
+)
+def batch(
+    input_dir: Path,
+    output_dir: Optional[Path],
+    model: str,
+    format: str,
+    chunk_duration: Optional[int],
+    filter_hallucinations: bool,
+    retry_hallucinations: bool,
+    pattern: str
+) -> None:
+    """Batch transcribe all audio files in a directory."""
+    try:
+        import glob
+
+        # Find all matching audio files
+        audio_files = list(input_dir.glob(pattern))
+
+        if not audio_files:
+            click.echo(f"❌ No audio files found matching pattern: {pattern}")
+            sys.exit(1)
+
+        # Set output directory
+        if output_dir is None:
+            output_dir = input_dir / '_output'
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        click.echo(f"🎙️  Found {len(audio_files)} audio files to transcribe")
+        click.echo(f"📁 Output directory: {output_dir}")
+        click.echo(f"🤖 Model: {model}")
+        if chunk_duration:
+            click.echo(f"🧩 Chunk duration: {chunk_duration}s")
+        click.echo(
+            f"🔍 Hallucination filtering: {'enabled' if filter_hallucinations else 'disabled'}")
+        if retry_hallucinations:
+            click.echo(f"🔄 Retry hallucinations: enabled")
+        click.echo()
+
+        # Create transcriber once for all files
+        transcriber = EnglishTranscriber(model_name=model)
+
+        success_count = 0
+        failed_files = []
+
+        for idx, audio_file in enumerate(audio_files, 1):
+            try:
+                click.echo(
+                    f"[{idx}/{len(audio_files)}] Transcribing: {audio_file.name}")
+
+                # Transcribe (chunked or standard)
+                if chunk_duration:
+                    result = transcriber.transcribe_chunked(
+                        audio=audio_file,
+                        chunk_duration_seconds=chunk_duration,
+                        filter_hallucinations=filter_hallucinations,
+                        retry_hallucinations=retry_hallucinations,
+                        verbose=False
+                    )
+                else:
+                    result = transcriber.transcribe(
+                        audio=audio_file,
+                        filter_hallucinations=filter_hallucinations,
+                        retry_hallucinations=retry_hallucinations,
+                        verbose=False
+                    )
+
+                # Save outputs
+                base_name = audio_file.stem
+
+                if format in ['text', 'both']:
+                    text_output = output_dir / f"{base_name}.txt"
+                    with open(text_output, 'w', encoding='utf-8') as f:
+                        f.write(result['text'])
+                    click.echo(f"  💾 Saved: {text_output.name}")
+
+                if format in ['json', 'both']:
+                    json_output = output_dir / f"{base_name}.json"
+                    with open(json_output, 'w', encoding='utf-8') as f:
+                        json.dump(result, f, indent=2, ensure_ascii=False)
+                    click.echo(f"  💾 Saved: {json_output.name}")
+
+                # Show hallucination filter stats if available
+                if 'hallucination_filter' in result:
+                    filter_info = result['hallucination_filter']
+                    removed = filter_info.get('removed_segment_count', 0)
+                    retried = filter_info.get('retried_segment_count', 0)
+                    if retried > 0:
+                        click.echo(f"  🔄 Retried {retried} segments")
+                    if removed > 0:
+                        click.echo(f"  🗑️  Removed {removed} segments")
+
+                success_count += 1
+                click.echo(
+                    f"  ✅ Complete ({len(result['text'])} chars, {len(result['segments'])} segments)")
+                click.echo()
+
+            except Exception as e:
+                logger.error(f"Failed to transcribe {audio_file.name}: {e}")
+                click.echo(f"  ❌ Error: {e}", err=True)
+                failed_files.append((audio_file.name, str(e)))
+                click.echo()
+
+        # Summary
+        click.echo("=" * 60)
+        click.echo(f"✅ Batch transcription complete!")
+        click.echo(
+            f"📊 Successfully transcribed: {success_count}/{len(audio_files)}")
+
+        if failed_files:
+            click.echo(f"❌ Failed: {len(failed_files)}")
+            click.echo("\nFailed files:")
+            for filename, error in failed_files:
+                click.echo(f"  - {filename}: {error}")
+
+        click.echo(f"\n💾 Output directory: {output_dir}")
+
+    except Exception as e:
+        logger.error(f"Batch transcription failed: {e}")
         click.echo(f"❌ Error: {e}", err=True)
         sys.exit(1)
 

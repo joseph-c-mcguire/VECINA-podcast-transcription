@@ -71,6 +71,20 @@ def example_basic_usage():
             first_segment = result['segments'][0]
             print(f"First segment: {first_segment['text'][:50]}...")
 
+        # Method 4: Chunked transcription for long files
+        print("\nMethod 4: Chunked transcription (better accuracy for long files)")
+        transcriber = create_transcriber(model_name="base")
+        result = transcriber.transcribe_chunked(
+            audio_file,
+            chunk_duration_seconds=300,  # 5-minute chunks
+            temperature=0.0,
+            initial_prompt="This is a podcast episode."
+        )
+
+        print(f"Chunked transcription complete!")
+        print(f"Total chunks: {result.get('num_chunks', 0)}")
+        print(f"Total text length: {len(result['text'])} characters")
+
     except Exception as e:
         print(f"❌ Error in basic usage: {e}")
 
@@ -178,12 +192,15 @@ def example_modal_usage():
         result = transcribe_with_modal(
             audio_file,
             model_name="base",
-            temperature=0.1
+            temperature=0.1,
+            chunk_duration_seconds=600  # Use 10-minute chunks for long files
         )
 
         print(f"Modal transcription completed!")
         print(f"Text (first 100 chars): {result['text'][:100]}...")
         print(f"Processed in Modal: {result.get('processed_in_modal', False)}")
+        if result.get('num_chunks'):
+            print(f"Chunks processed: {result.get('num_chunks')}")
 
     except Exception as e:
         print(f"❌ Error with Modal usage: {e}")

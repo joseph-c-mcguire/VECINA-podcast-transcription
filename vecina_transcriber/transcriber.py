@@ -7,14 +7,222 @@ and transcription with various quality control and customization options.
 """
 
 import logging
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
 import whisper
+from pydub import AudioSegment
 
 logger = logging.getLogger(__name__)
+
+
+def _is_hallucination(segment: Dict[str, Any], compression_threshold: float = 2.4) -> bool:
+    """
+    Detect if a segment is likely a hallucination based on Whisper quality metrics.
+
+    Args:
+        segment: Segment dictionary from Whisper output
+        compression_threshold: Maximum acceptable compression ratio
+
+    Returns:
+        True if segment appears to be a hallucination
+    """
+    # Check compression ratio (high ratio = repetitive text)
+    if segment.get('compression_ratio', 0) > compression_threshold:
+        return True
+
+    # Check for very high no_speech probability (likely silence or noise)
+    if segment.get('no_speech_prob', 0) > 0.8:
+        return True
+
+    # Check for extremely repetitive patterns in text
+    text = segment.get('text', '').strip()
+    if len(text) > 50:
+        # Check if text has very repetitive 3-word phrases
+        words = text.split()
+        if len(words) > 10:
+            # Count unique 3-word phrases
+            phrases = set()
+            for i in range(len(words) - 2):
+                phrase = ' '.join(words[i:i+3])
+                phrases.add(phrase)
+            # If less than 20% unique phrases, likely hallucination
+            if len(phrases) / (len(words) - 2) < 0.2:
+                return True
+
+    return False
+
+
+def _retry_segment_transcription(
+    model: Any,
+    audio: Union[str, Path],
+    start_time: float,
+    end_time: float,
+    original_segment: Dict[str, Any],
+    language: str = "en"
+) -> Optional[Dict[str, Any]]:
+    """
+    Retry transcribing a segment with different parameters.
+
+    Args:
+        model: Whisper model instance
+        audio: Path to audio file
+        start_time: Segment start time in seconds
+        end_time: Segment end time in seconds
+        original_segment: Original segment dictionary
+        language: Language code
+
+    Returns:
+        New segment if successful and better, None otherwise
+    """
+    try:
+        from pydub import AudioSegment as AS
+
+        # Extract the segment audio
+        full_audio = AS.from_file(str(audio))
+        segment_audio = full_audio[int(start_time * 1000):int(end_time * 1000)]
+
+        # Save to temporary file
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp:
+            segment_audio.export(tmp.name, format='wav')
+            tmp_path = tmp.name
+
+        try:
+            # Retry with different parameters:
+            # - Higher temperature for more variation
+            # - No conditioning on previous text
+            # - Lower compression ratio threshold
+            retry_result = model.transcribe(
+                audio=tmp_path,
+                language=language,
+                temperature=1.0,  # Higher temperature
+                condition_on_previous_text=False,  # Don't use context
+                compression_ratio_threshold=2.0,  # Stricter threshold
+                no_speech_threshold=0.5,  # Lower silence threshold
+                logprob_threshold=-0.5,  # Stricter confidence
+                verbose=False
+            )
+
+            # Check if retry is better
+            if retry_result and 'segments' in retry_result and retry_result['segments']:
+                new_segment = retry_result['segments'][0]
+                new_compression = new_segment.get(
+                    'compression_ratio', float('inf'))
+                old_compression = original_segment.get(
+                    'compression_ratio', float('inf'))
+
+                # Accept if compression ratio improved significantly
+                if new_compression < old_compression * 0.7 and new_compression < 2.4:
+                    logger.info(
+                        f"Retry successful at {start_time:.2f}s: "
+                        f"compression {old_compression:.2f} -> {new_compression:.2f}"
+                    )
+                    # Update timing to match original
+                    new_segment['start'] = start_time
+                    new_segment['end'] = end_time
+                    new_segment['id'] = original_segment['id']
+                    new_segment['retried'] = True
+                    return new_segment
+        finally:
+            # Clean up temp file
+            Path(tmp_path).unlink(missing_ok=True)
+
+    except Exception as e:
+        logger.debug(f"Retry failed for segment at {start_time:.2f}s: {e}")
+
+    return None
+
+
+def _filter_hallucinations(
+    result: Dict[str, Any],
+    compression_threshold: float = 2.4,
+    retry_hallucinations: bool = False,
+    model: Any = None,
+    audio: Union[str, Path, None] = None,
+    language: str = "en"
+) -> Dict[str, Any]:
+    """
+    Filter out hallucinated segments from transcription result.
+
+    Args:
+        result: Transcription result dictionary
+        compression_threshold: Maximum acceptable compression ratio
+        retry_hallucinations: Whether to retry hallucinated segments
+        model: Whisper model instance (required if retry_hallucinations=True)
+        audio: Audio file path (required if retry_hallucinations=True)
+        language: Language code for retries
+
+    Returns:
+        Filtered result with hallucinations removed or retried
+    """
+    if 'segments' not in result:
+        return result
+
+    original_count = len(result['segments'])
+    filtered_segments = []
+    removed_segments = []
+    retried_segments = []
+
+    for segment in result['segments']:
+        if _is_hallucination(segment, compression_threshold):
+            # Try to retry if enabled and possible
+            if retry_hallucinations and model is not None and audio is not None:
+                retry_segment = _retry_segment_transcription(
+                    model=model,
+                    audio=audio,
+                    start_time=segment.get('start', 0),
+                    end_time=segment.get('end', 0),
+                    original_segment=segment,
+                    language=language
+                )
+
+                if retry_segment:
+                    # Retry successful, use new segment
+                    filtered_segments.append(retry_segment)
+                    retried_segments.append(segment)
+                    continue
+
+            # No retry or retry failed - remove segment
+            logger.warning(
+                f"Removing hallucinated segment at {segment.get('start', 0):.2f}s: "
+                f"compression_ratio={segment.get('compression_ratio', 0):.2f}, "
+                f"no_speech_prob={segment.get('no_speech_prob', 0):.2f}"
+            )
+            removed_segments.append(segment)
+        else:
+            filtered_segments.append(segment)
+
+    # Rebuild full text from filtered segments
+    filtered_text = ' '.join(seg['text'].strip() for seg in filtered_segments)
+
+    result['segments'] = filtered_segments
+    result['text'] = filtered_text
+    result['hallucination_filter'] = {
+        'enabled': True,
+        'retry_enabled': retry_hallucinations,
+        'original_segment_count': original_count,
+        'filtered_segment_count': len(filtered_segments),
+        'removed_segment_count': len(removed_segments),
+        'retried_segment_count': len(retried_segments),
+        'compression_threshold': compression_threshold
+    }
+
+    if removed_segments or retried_segments:
+        msg_parts = []
+        if retried_segments:
+            msg_parts.append(f"Retried {len(retried_segments)} segments")
+        if removed_segments:
+            msg_parts.append(f"Removed {len(removed_segments)} segments")
+        logger.info(
+            f"Hallucination filter: {', '.join(msg_parts)} "
+            f"({(len(removed_segments) + len(retried_segments))/original_count*100:.1f}% of total)"
+        )
+
+    return result
 
 
 class EnglishTranscriber:
@@ -79,6 +287,8 @@ class EnglishTranscriber:
         clip_timestamps: Union[str, List[float]] = "0",
         hallucination_silence_threshold: Optional[float] = None,
         language: str = "en",
+        filter_hallucinations: bool = True,
+        retry_hallucinations: bool = False,
         **decode_options,
     ) -> Dict:
         """
@@ -100,6 +310,8 @@ class EnglishTranscriber:
             clip_timestamps: Process specific time ranges ("start,end,start,end,...")
             hallucination_silence_threshold: Skip silent periods in word timestamps
             language: Language code (default: "en" for English)
+            filter_hallucinations: Remove hallucinated segments (default: True)
+            retry_hallucinations: Retry transcribing hallucinated segments with different parameters (default: False)
             **decode_options: Additional parameters passed to DecodingOptions
 
         Returns:
@@ -156,6 +368,19 @@ class EnglishTranscriber:
 
             logger.info("Transcription completed. Text length: %d",
                         len(result['text']))
+
+            # Filter hallucinations if enabled
+            if filter_hallucinations:
+                result = _filter_hallucinations(
+                    result=result,
+                    compression_threshold=compression_ratio_threshold or 2.4,
+                    retry_hallucinations=retry_hallucinations,
+                    model=self.model if retry_hallucinations else None,
+                    audio=audio_input if retry_hallucinations and isinstance(
+                        audio_input, (str, Path)) else None,
+                    language=language
+                )
+
             return result
 
         except Exception as e:
@@ -230,6 +455,179 @@ class EnglishTranscriber:
             List of model names
         """
         return list(whisper.available_models())
+
+    @staticmethod
+    def split_audio_into_chunks(
+        audio_file: Union[str, Path],
+        chunk_duration_seconds: int = 600,
+        output_dir: Optional[Union[str, Path]] = None
+    ) -> List[Path]:
+        """
+        Split an audio file into fixed-duration chunks.
+
+        Args:
+            audio_file: Path to the audio file to split
+            chunk_duration_seconds: Duration of each chunk in seconds (default: 600 = 10 minutes)
+            output_dir: Directory to save chunks (default: temp directory)
+
+        Returns:
+            List of paths to the chunk files
+        """
+        audio_path = Path(audio_file)
+        if not audio_path.exists():
+            raise FileNotFoundError(f"Audio file not found: {audio_path}")
+
+        logger.info(f"Loading audio file for chunking: {audio_path}")
+        audio = AudioSegment.from_file(str(audio_path))
+
+        total_duration_ms = len(audio)
+        chunk_duration_ms = chunk_duration_seconds * 1000
+
+        # Determine output directory
+        if output_dir is None:
+            output_dir = Path(tempfile.mkdtemp(prefix="audio_chunks_"))
+        else:
+            output_dir = Path(output_dir)
+            output_dir.mkdir(parents=True, exist_ok=True)
+
+        chunk_files = []
+        chunk_num = 0
+
+        for start_ms in range(0, total_duration_ms, chunk_duration_ms):
+            end_ms = min(start_ms + chunk_duration_ms, total_duration_ms)
+            chunk = audio[start_ms:end_ms]
+
+            chunk_filename = f"{audio_path.stem}_chunk_{chunk_num:04d}{audio_path.suffix}"
+            chunk_path = output_dir / chunk_filename
+
+            chunk.export(str(chunk_path), format=audio_path.suffix.lstrip('.'))
+            chunk_files.append(chunk_path)
+
+            logger.info(
+                f"Created chunk {chunk_num}: {chunk_path} ({start_ms/1000:.1f}s - {end_ms/1000:.1f}s)")
+            chunk_num += 1
+
+        logger.info(f"Split audio into {len(chunk_files)} chunks")
+        return chunk_files
+
+    def transcribe_chunked(
+        self,
+        audio: Union[str, Path],
+        chunk_duration_seconds: int = 600,
+        cleanup_chunks: bool = True,
+        filter_hallucinations: bool = True,
+        retry_hallucinations: bool = False,
+        **transcription_kwargs: Any
+    ) -> Dict:
+        """
+        Transcribe a long audio file by splitting it into chunks first.
+        This improves accuracy for long recordings.
+
+        Args:
+            audio: Path to the audio file
+            chunk_duration_seconds: Duration of each chunk in seconds (default: 600 = 10 minutes)
+            cleanup_chunks: Whether to delete chunk files after transcription (default: True)
+            filter_hallucinations: Remove hallucinated segments (default: True)
+            retry_hallucinations: Retry transcribing hallucinated segments (default: False)
+            **transcription_kwargs: Additional arguments passed to transcribe()
+
+        Returns:
+            Dictionary containing:
+            - "text": Full merged transcription
+            - "segments": List of all segments with adjusted timestamps
+            - "chunks": List of chunk-level metadata
+            - "language": Language code
+        """
+        audio_path = Path(audio)
+        logger.info(f"Starting chunked transcription of {audio_path}")
+        logger.info(f"Chunk duration: {chunk_duration_seconds} seconds")
+
+        # Split audio into chunks
+        chunk_files = self.split_audio_into_chunks(
+            audio_file=audio_path,
+            chunk_duration_seconds=chunk_duration_seconds
+        )
+
+        try:
+            all_text = []
+            all_segments = []
+            chunk_metadata = []
+            time_offset = 0.0
+            detected_language = None
+
+            # Transcribe each chunk
+            for idx, chunk_file in enumerate(chunk_files):
+                logger.info(
+                    f"Transcribing chunk {idx + 1}/{len(chunk_files)}: {chunk_file.name}")
+
+                result = self.transcribe(
+                    audio=chunk_file,
+                    filter_hallucinations=filter_hallucinations,
+                    retry_hallucinations=retry_hallucinations,
+                    **transcription_kwargs
+                )
+
+                # Store detected language from first chunk
+                if detected_language is None:
+                    detected_language = result.get("language", "en")
+
+                # Collect text
+                all_text.append(result["text"])
+
+                # Adjust segment timestamps and collect
+                for segment in result.get("segments", []):
+                    adjusted_segment = segment.copy()
+                    adjusted_segment["start"] += time_offset
+                    adjusted_segment["end"] += time_offset
+                    adjusted_segment["chunk_index"] = idx
+                    all_segments.append(adjusted_segment)
+
+                # Store chunk metadata
+                chunk_metadata.append({
+                    "chunk_index": idx,
+                    "chunk_file": chunk_file.name,
+                    "time_offset": time_offset,
+                    "duration": result.get("segments", [])[-1]["end"] if result.get("segments") else 0.0,
+                    "text_length": len(result["text"])
+                })
+
+                # Update time offset for next chunk
+                if result.get("segments"):
+                    time_offset += result["segments"][-1]["end"]
+
+            # Merge results
+            merged_result = {
+                "text": " ".join(all_text),
+                "segments": all_segments,
+                "chunks": chunk_metadata,
+                "language": detected_language,
+                "num_chunks": len(chunk_files),
+                "chunk_duration_seconds": chunk_duration_seconds
+            }
+
+            logger.info(
+                f"Chunked transcription complete. Total text length: {len(merged_result['text'])}")
+            return merged_result
+
+        finally:
+            # Cleanup chunk files if requested
+            if cleanup_chunks:
+                for chunk_file in chunk_files:
+                    try:
+                        chunk_file.unlink()
+                        logger.debug(f"Deleted chunk file: {chunk_file}")
+                    except Exception as e:
+                        logger.warning(
+                            f"Failed to delete chunk file {chunk_file}: {e}")
+
+                # Try to remove the temp directory
+                try:
+                    chunk_dir = chunk_files[0].parent
+                    if chunk_dir.exists() and not list(chunk_dir.iterdir()):
+                        chunk_dir.rmdir()
+                        logger.debug(f"Deleted temp directory: {chunk_dir}")
+                except Exception as e:
+                    logger.warning(f"Failed to delete temp directory: {e}")
 
 
 def create_transcriber(

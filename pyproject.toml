@@ -39,6 +39,7 @@ dependencies = [
     "lxml>=4.6.0",
     "whisper (>=1.1.10,<2.0.0)",
     "fastapi[standard]>=0.121.2",
+    "modal>=1.2.2",
 ]
 
 [project.optional-dependencies]
@@ -125,4 +126,9 @@ exclude_lines = [
     "def __repr__",
     "raise AssertionError",
     "raise NotImplementedError",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4.2",
 ]

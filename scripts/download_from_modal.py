@@ -16,7 +16,7 @@ data_volume = modal.Volume.from_name("vecina-data", create_if_missing=True)
 
 @app.function(volumes={"/data": data_volume}, timeout=600)
 def list_and_download():
-    """List and return all transcript files from Modal volume."""
+    """List and return all transcript files from Modal volume, preserving directory structure."""
     from pathlib import Path
 
     transcripts_dir = Path("/data/transcripts")
@@ -25,10 +25,12 @@ def list_and_download():
         return {"files": [], "count": 0}
 
     files_data = []
-    for p in transcripts_dir.glob("*.*"):
+    for p in transcripts_dir.rglob("*.*"):
         if p.is_file():
+            # Get relative path from transcripts_dir to preserve folder structure
+            rel_path = p.relative_to(transcripts_dir)
             files_data.append({
-                "name": p.name,
+                "name": str(rel_path).replace("\\", "/"),
                 "data": p.read_bytes()
             })
 
@@ -52,6 +54,7 @@ def main(output_dir: str = "_data/_output"):
 
     for file_info in result["files"]:
         target = local_dir / file_info["name"]
+        target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(file_info["data"])
         print(
             f"✓ Downloaded {file_info['name']} ({len(file_info['data'])} bytes)")

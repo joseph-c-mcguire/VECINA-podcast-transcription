@@ -3320,6 +3320,7 @@ dependencies = [
     { name = "fastapi", extra = ["standard"] },
     { name = "feedparser" },
     { name = "lxml" },
+    { name = "modal" },
     { name = "openai-whisper" },
     { name = "pydub" },
     { name = "requests" },
@@ -3348,6 +3349,12 @@ modal = [
     { name = "modal" },
 ]
 
+[package.dev-dependencies]
+dev = [
+    { name = "pytest", version = "8.4.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
+    { name = "pytest", version = "9.0.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.10'" },
+]
+
 [package.metadata]
 requires-dist = [
     { name = "beautifulsoup4", specifier = ">=4.9.0" },
@@ -3358,6 +3365,7 @@ requires-dist = [
     { name = "flake8", marker = "extra == 'dev'", specifier = ">=3.8" },
     { name = "isort", marker = "extra == 'dev'", specifier = ">=5.0" },
     { name = "lxml", specifier = ">=4.6.0" },
+    { name = "modal", specifier = ">=1.2.2" },
     { name = "modal", marker = "extra == 'all'", specifier = ">=0.55.0" },
     { name = "modal", marker = "extra == 'modal'", specifier = ">=0.55.0" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=0.910" },
@@ -3372,6 +3380,9 @@ requires-dist = [
     { name = "yt-dlp", specifier = ">=2023.1.6" },
 ]
 provides-extras = ["dev", "modal", "all"]
+
+[package.metadata.requires-dev]
+dev = [{ name = "pytest", specifier = ">=8.4.2" }]
 
 [[package]]
 name = "watchfiles"

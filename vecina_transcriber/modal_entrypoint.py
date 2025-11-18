@@ -65,10 +65,70 @@ def _load_config() -> Dict[str, Any]:
         config_file = Path(CONFIG_PATH)
         if config_file.exists():
             data = json.loads(config_file.read_text(encoding="utf-8"))
-            defaults.update({k: v for k, v in data.items() if v is not None})
+            defaults.update({k: v for k, v in data.items()
+                            if v is not None and k != "overrides"})
     except Exception as e:
         logger.warning(f"Failed to load config.json, using defaults: {e}")
     return defaults
+
+
+def _get_config_for_file(audio_path: Union[str, Path]) -> Dict[str, Any]:
+    """Get configuration for a specific audio file, merging file-specific overrides with defaults."""
+    import fnmatch
+
+    base_config = _load_config()
+    audio_path = Path(audio_path)
+
+    try:
+        config_file = Path(CONFIG_PATH)
+        if not config_file.exists():
+            return base_config
+
+        full_config = json.loads(config_file.read_text(encoding="utf-8"))
+        overrides = full_config.get("overrides", {})
+
+        if not overrides:
+            return base_config
+
+        # Get relative path from AUDIO_DIR for matching
+        try:
+            rel_path = audio_path.relative_to(AUDIO_DIR)
+            rel_path_str = str(rel_path).replace("\\", "/")
+        except ValueError:
+            # If not relative to AUDIO_DIR, use just the filename
+            rel_path_str = audio_path.name
+
+        # Check for exact match first, then glob patterns
+        matched_config = base_config.copy()
+
+        # Try exact path match
+        if rel_path_str in overrides:
+            logger.info(f"Applying exact match override for: {rel_path_str}")
+            matched_config.update(overrides[rel_path_str])
+            return matched_config
+
+        # Try filename match
+        if audio_path.name in overrides:
+            logger.info(f"Applying filename override for: {audio_path.name}")
+            matched_config.update(overrides[audio_path.name])
+            return matched_config
+
+        # Try glob patterns
+        for pattern, override_settings in overrides.items():
+            if "*" in pattern or "?" in pattern or "[" in pattern:
+                # It's a glob pattern
+                if fnmatch.fnmatch(rel_path_str, pattern) or fnmatch.fnmatch(audio_path.name, pattern):
+                    logger.info(
+                        f"Applying glob pattern override '{pattern}' for: {rel_path_str}")
+                    matched_config.update(override_settings)
+                    # Don't break - allow multiple patterns to apply (later ones override earlier)
+
+        return matched_config
+
+    except Exception as e:
+        logger.warning(
+            f"Failed to load overrides for {audio_path}, using base config: {e}")
+        return base_config
 
 
 def _ensure_dirs() -> None:
@@ -87,6 +147,7 @@ def transcribe_audio_modal(
     audio_data: bytes,
     filename: str,
     model_name: str = "base",
+    chunk_duration_seconds: Optional[int] = None,
     **transcription_kwargs: Any
 ) -> Dict[str, Any]:
     """
@@ -96,6 +157,7 @@ def transcribe_audio_modal(
         audio_data: Raw audio file bytes
         filename: Original filename for context
         model_name: Whisper model to use
+        chunk_duration_seconds: Optional chunk duration for long audio files (improves accuracy)
         **transcription_kwargs: Additional transcription parameters
 
     Returns:
@@ -119,12 +181,32 @@ def transcribe_audio_modal(
             temp_file.write(audio_data)
             temp_audio_path = temp_file.name
 
-        # Transcribe the audio
-        result = transcriber.transcribe(
-            audio=temp_audio_path,
-            verbose=True,
-            **transcription_kwargs
-        )
+        # Transcribe the audio (chunked or standard)
+        # Enable hallucination filtering by default, retry is opt-in
+        filter_hallucinations = transcription_kwargs.pop(
+            'filter_hallucinations', True)
+        retry_hallucinations = transcription_kwargs.pop(
+            'retry_hallucinations', False)
+
+        if chunk_duration_seconds and chunk_duration_seconds > 0:
+            logger.info(
+                f"Using chunked transcription with {chunk_duration_seconds}s chunks")
+            result = transcriber.transcribe_chunked(
+                audio=temp_audio_path,
+                chunk_duration_seconds=chunk_duration_seconds,
+                filter_hallucinations=filter_hallucinations,
+                retry_hallucinations=retry_hallucinations,
+                verbose=True,
+                **transcription_kwargs
+            )
+        else:
+            result = transcriber.transcribe(
+                audio=temp_audio_path,
+                filter_hallucinations=filter_hallucinations,
+                retry_hallucinations=retry_hallucinations,
+                verbose=True,
+                **transcription_kwargs
+            )
 
         # Clean up temporary file
         Path(temp_audio_path).unlink()
@@ -174,6 +256,12 @@ def batch_transcribe_modal(
 
     results = []
 
+    # Enable hallucination filtering by default, retry is opt-in
+    filter_hallucinations = transcription_kwargs.pop(
+        'filter_hallucinations', True)
+    retry_hallucinations = transcription_kwargs.pop(
+        'retry_hallucinations', False)
+
     # Create transcriber once for all files
     transcriber = EnglishTranscriber(
         model_name=model_name,
@@ -192,9 +280,11 @@ def batch_transcribe_modal(
                 temp_file.write(audio_data)
                 temp_audio_path = temp_file.name
 
-            # Transcribe the audio
+            # Transcribe the audio with hallucination filtering
             result = transcriber.transcribe(
                 audio=temp_audio_path,
+                filter_hallucinations=filter_hallucinations,
+                retry_hallucinations=retry_hallucinations,
                 verbose=False,  # Reduce verbosity for batch processing
                 **transcription_kwargs
             )
@@ -278,13 +368,18 @@ def list_available_models_modal() -> List[str]:
     timeout=3600,
     memory=8192,
 )
-def transcribe_single_file(audio_path_str: str, config: Dict[str, Any]) -> Dict[str, Any]:
-    """Transcribe a single audio file (parallel worker function)."""
+def transcribe_single_file(audio_path_str: str, base_config: Dict[str, Any]) -> Dict[str, Any]:
+    """Transcribe a single audio file (parallel worker function) with file-specific config."""
     from vecina_transcriber.transcriber import EnglishTranscriber
     import whisper  # noqa: F401
 
     audio_path = Path(audio_path_str)
+
+    # Get file-specific configuration (merged with base config)
+    config = _get_config_for_file(audio_path)
+
     model_name = config["model_name"]
+    chunk_duration = config.get("chunk_duration_seconds")
 
     try:
         logger.info(f"Transcribing {audio_path.name}")
@@ -296,14 +391,36 @@ def transcribe_single_file(audio_path_str: str, config: Dict[str, Any]) -> Dict[
                 "device") == "auto" else config.get("device")
         )
 
-        result = transcriber.transcribe(
-            audio=str(audio_path),
-            temperature=config.get("temperature", 0.0),
-            word_timestamps=config.get("word_timestamps", False),
-            language=config.get("language", "en"),
-            initial_prompt=config.get("initial_prompt"),
-            verbose=config.get("batch_verbose", False)
-        )
+        # Use chunked transcription if configured
+        # Enable hallucination filtering by default (can be overridden in config)
+        filter_hallucinations = config.get("filter_hallucinations", True)
+        retry_hallucinations = config.get("retry_hallucinations", False)
+
+        if chunk_duration and chunk_duration > 0:
+            logger.info(
+                f"Using chunked transcription with {chunk_duration}s chunks")
+            result = transcriber.transcribe_chunked(
+                audio=str(audio_path),
+                chunk_duration_seconds=chunk_duration,
+                filter_hallucinations=filter_hallucinations,
+                retry_hallucinations=retry_hallucinations,
+                temperature=config.get("temperature", 0.0),
+                word_timestamps=config.get("word_timestamps", False),
+                language=config.get("language", "en"),
+                initial_prompt=config.get("initial_prompt"),
+                verbose=config.get("batch_verbose", False)
+            )
+        else:
+            result = transcriber.transcribe(
+                audio=str(audio_path),
+                filter_hallucinations=filter_hallucinations,
+                retry_hallucinations=retry_hallucinations,
+                temperature=config.get("temperature", 0.0),
+                word_timestamps=config.get("word_timestamps", False),
+                language=config.get("language", "en"),
+                initial_prompt=config.get("initial_prompt"),
+                verbose=config.get("batch_verbose", False)
+            )
 
         result.update({
             "filename": audio_path.name,

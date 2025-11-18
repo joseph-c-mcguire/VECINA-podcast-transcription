@@ -7,5 +7,26 @@
   "formats": ["txt", "json"],
   "batch_verbose": true,
   "max_parallel_workers": 10,
-  "initial_prompt": "This is a podcast that may contain both English and Spanish. The speakers discuss various topics in both languages."
+  "initial_prompt": "This is a podcast about VECINA, a non-profit organization of the RIOS Institute focused on community involvement. The speakers may discuss topics in both English and Spanish.",
+  "chunk_duration_seconds": 600,
+  "filter_hallucinations": true,
+  "retry_hallucinations": true,
+  "overrides": {
+    "podcasts/spanish/*.mp3": {
+      "comment": "Spanish-only episodes in spanish/ subfolder",
+      "language": "es",
+      "initial_prompt": "Este es un podcast sobre VECINA, una organización sin fines de lucro del Instituto RIOS enfocada en la participación comunitaria."
+    },
+    "podcasts/english/*.mp3": {
+      "comment": "English-only episodes in english/ subfolder",
+      "language": "en",
+      "initial_prompt": "This is an English podcast about VECINA, a non-profit organization of the RIOS Institute focused on community involvement."
+    },
+    "podcasts/english/18c0b1432fe8829abf257468c79ea431.mp3": {
+      "comment": "Large English podcast - use small chunks for better accuracy",
+      "language": "en",
+      "chunk_duration_seconds": 300,
+      "initial_prompt": "This is an English podcast about VECINA, a non-profit organization of the RIOS Institute focused on community involvement."
+    }
+  }
 }
