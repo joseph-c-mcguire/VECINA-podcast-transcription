@@ -1,0 +1,11 @@
+{
+  "model_name": "large",
+  "language": "en",
+  "temperature": 0.0,
+  "word_timestamps": true,
+  "device": "auto",
+  "formats": ["txt", "json"],
+  "batch_verbose": true,
+  "max_parallel_workers": 10,
+  "initial_prompt": "This is a podcast that may contain both English and Spanish. The speakers discuss various topics in both languages."
+}

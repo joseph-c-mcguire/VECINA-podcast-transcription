@@ -36,6 +36,11 @@ image = (
     .pip_install("fastapi[standard]")
     .pip_install_from_pyproject("pyproject.toml")
     .apt_install(["ffmpeg"])  # Required for audio processing
+    # Copy local package into container and install
+    .add_local_dir("vecina_transcriber", remote_path="/root/vecina_transcriber", copy=True)
+    .add_local_file("pyproject.toml", remote_path="/root/pyproject.toml", copy=True)
+    .workdir("/root")
+
 )
 
 MODEL_CACHE_DIR = "/cache/whisper"
@@ -270,65 +275,100 @@ def list_available_models_modal() -> List[str]:
     image=image,
     volumes={MODEL_CACHE_DIR: model_volume, DATA_ROOT: data_volume},
     gpu="T4",
-    timeout=7200,
+    timeout=3600,
     memory=8192,
 )
-def transcribe_all_modal() -> Dict[str, Any]:
-    """Transcribe all audio files in the data volume using config settings."""
+def transcribe_single_file(audio_path_str: str, config: Dict[str, Any]) -> Dict[str, Any]:
+    """Transcribe a single audio file (parallel worker function)."""
     from vecina_transcriber.transcriber import EnglishTranscriber
     import whisper  # noqa: F401
 
+    audio_path = Path(audio_path_str)
+    model_name = config["model_name"]
+
+    try:
+        logger.info(f"Transcribing {audio_path.name}")
+
+        transcriber = EnglishTranscriber(
+            model_name=model_name,
+            download_root=MODEL_CACHE_DIR,
+            device=None if config.get(
+                "device") == "auto" else config.get("device")
+        )
+
+        result = transcriber.transcribe(
+            audio=str(audio_path),
+            temperature=config.get("temperature", 0.0),
+            word_timestamps=config.get("word_timestamps", False),
+            language=config.get("language", "en"),
+            initial_prompt=config.get("initial_prompt"),
+            verbose=config.get("batch_verbose", False)
+        )
+
+        result.update({
+            "filename": audio_path.name,
+            "model_used": model_name,
+        })
+
+        # Save outputs
+        base_out = Path(TRANSCRIPTS_DIR) / audio_path.stem
+        if "txt" in config.get("formats", []):
+            (base_out.with_suffix(".txt")).write_text(
+                result["text"], encoding="utf-8")
+        if "json" in config.get("formats", []):
+            (base_out.with_suffix(".json")).write_text(
+                json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+
+        data_volume.commit()  # Commit after each file
+        logger.info(f"Completed {audio_path.name}")
+        return {"filename": audio_path.name, "status": "ok"}
+
+    except Exception as e:
+        logger.error(f"Failed {audio_path.name}: {e}")
+        return {"filename": audio_path.name, "status": "error", "error": str(e)}
+
+
+@app.function(
+    image=image,
+    volumes={MODEL_CACHE_DIR: model_volume, DATA_ROOT: data_volume},
+    timeout=7200,
+)
+def transcribe_all_modal() -> Dict[str, Any]:
+    """Transcribe all audio files in the data volume using parallel workers."""
     _ensure_dirs()
     cfg = _load_config()
     model_name = cfg["model_name"]
-    logger.info(f"Batch transcription start: model={model_name}")
+    max_workers = cfg.get("max_parallel_workers", 10)
 
-    transcriber = EnglishTranscriber(
-        model_name=model_name,
-        download_root=MODEL_CACHE_DIR,
-        device=None if cfg.get("device") == "auto" else cfg.get("device")
-    )
+    logger.info(
+        f"Batch transcription start: model={model_name}, max_workers={max_workers}")
 
     audio_exts = {".mp3", ".wav", ".m4a", ".ogg", ".flac"}
     audio_files = [p for p in Path(AUDIO_DIR).rglob(
         "*") if p.is_file() and p.suffix.lower() in audio_exts]
+
     if not audio_files:
         logger.warning("No audio files found in volume.")
         return {"processed": 0, "results": []}
 
-    results: List[Dict[str, Any]] = []
-    for audio_path in audio_files:
-        try:
-            logger.info(f"Transcribing {audio_path.name}")
-            result = transcriber.transcribe(
-                audio=str(audio_path),
-                temperature=cfg.get("temperature", 0.0),
-                word_timestamps=cfg.get("word_timestamps", False),
-                language=cfg.get("language", "en"),
-                verbose=cfg.get("batch_verbose", False)
-            )
-            result.update({
-                "filename": audio_path.name,
-                "model_used": model_name,
-            })
-            # Save outputs
-            base_out = Path(TRANSCRIPTS_DIR) / audio_path.stem
-            if "txt" in cfg.get("formats", []):
-                (base_out.with_suffix(".txt")).write_text(
-                    result["text"], encoding="utf-8")
-            if "json" in cfg.get("formats", []):
-                (base_out.with_suffix(".json")).write_text(json.dumps(
-                    result, ensure_ascii=False, indent=2), encoding="utf-8")
-            results.append({"filename": audio_path.name, "status": "ok"})
-        except Exception as e:
-            logger.error(f"Failed {audio_path.name}: {e}")
-            results.append({"filename": audio_path.name,
-                           "status": "error", "error": str(e)})
+    logger.info(f"Found {len(audio_files)} audio file(s) to transcribe")
+
+    # Prepare inputs for parallel map
+    audio_paths_str = [str(p) for p in audio_files]
+    configs = [cfg for _ in audio_files]
+
+    # Run transcriptions in parallel using .map()
+    results = list(transcribe_single_file.map(audio_paths_str, configs))
 
     summary = {"processed": len(results), "results": results}
     Path(TRANSCRIPTS_DIR, "summary.json").write_text(
-        json.dumps(summary, indent=2), encoding="utf-8")
-    logger.info("Batch transcription complete")
+        json.dumps(summary, indent=2), encoding="utf-8"
+    )
+    data_volume.commit()  # Final commit
+
+    logger.info(
+        f"Batch transcription complete: {len(results)} files processed")
     return summary
 
 
