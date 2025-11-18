@@ -6,7 +6,6 @@ This module provides Modal deployment capabilities for the VECINA transcription 
 allowing for scalable cloud-based audio transcription using Modal's serverless platform.
 """
 
-import io
 import json
 import logging
 import tempfile
@@ -15,7 +14,9 @@ from typing import Any, Dict, List, Optional, Union
 
 import modal
 
-from vecina_transcriber.transcriber import EnglishTranscriber
+# NOTE: We avoid importing the transcriber (and thus whisper) at module import time
+# so that `modal serve` works even if local env lacks the heavy whisper dependency.
+# Imports are performed lazily inside functions that run in the Modal container.
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -24,29 +25,58 @@ logger = logging.getLogger(__name__)
 # Modal app definition
 app = modal.App("vecina-transcriber")
 
+# Shared volumes: one for model cache, one for data (audio + transcripts)
+model_volume = modal.Volume.from_name("whisper-models", create_if_missing=True)
+data_volume = modal.Volume.from_name("vecina-data", create_if_missing=True)
+
 # Define the Modal image with required dependencies
 image = (
-    modal.Image.debian_slim(python_version="3.13")
-    .pip_install("openai-whisper torch numpy")
-    .add_local_dir("vecina_transcriber")
-    .add_local_dir("_data")  # Include local module
+    modal.Image.debian_slim(python_version="3.11")
+    # FastAPI for ASGI app + project deps
+    .pip_install("fastapi[standard]")
     .pip_install_from_pyproject("pyproject.toml")
     .apt_install(["ffmpeg"])  # Required for audio processing
 )
 
-# Shared volume for model caching
-volume = modal.Volume.from_name("whisper-models", create_if_missing=True)
-
-# Model cache directory
 MODEL_CACHE_DIR = "/cache/whisper"
+DATA_ROOT = "/data"
+AUDIO_DIR = f"{DATA_ROOT}/audio"
+TRANSCRIPTS_DIR = f"{DATA_ROOT}/transcripts"
+CONFIG_PATH = f"{DATA_ROOT}/config.json"
+
+
+def _load_config() -> Dict[str, Any]:
+    """Load configuration from JSON file in data volume, provide defaults if missing."""
+    defaults: Dict[str, Any] = {
+        "model_name": "base",
+        "language": "en",
+        "temperature": 0.0,
+        "word_timestamps": False,
+        "device": "auto",
+        "formats": ["txt", "json"],
+        "batch_verbose": False,
+    }
+    try:
+        config_file = Path(CONFIG_PATH)
+        if config_file.exists():
+            data = json.loads(config_file.read_text(encoding="utf-8"))
+            defaults.update({k: v for k, v in data.items() if v is not None})
+    except Exception as e:
+        logger.warning(f"Failed to load config.json, using defaults: {e}")
+    return defaults
+
+
+def _ensure_dirs() -> None:
+    for p in (DATA_ROOT, AUDIO_DIR, TRANSCRIPTS_DIR, MODEL_CACHE_DIR):
+        Path(p).mkdir(parents=True, exist_ok=True)
 
 
 @app.function(
     image=image,
-    volumes={MODEL_CACHE_DIR: volume},
-    gpu="T4",  # Use T4 GPU for faster processing
-    timeout=3600,  # 1 hour timeout
-    memory=8192,  # 8GB memory
+    volumes={MODEL_CACHE_DIR: model_volume, DATA_ROOT: data_volume},
+    gpu="T4",
+    timeout=3600,
+    memory=8192,
 )
 def transcribe_audio_modal(
     audio_data: bytes,
@@ -66,6 +96,9 @@ def transcribe_audio_modal(
     Returns:
         Dictionary containing transcription results
     """
+    # Lazy imports to avoid local ModuleNotFoundError during `modal serve`
+    import whisper  # noqa: F401 (ensures model package is present in container)
+    from vecina_transcriber.transcriber import EnglishTranscriber
     logger.info(
         f"Starting transcription of {filename} using model {model_name}")
 
@@ -108,9 +141,9 @@ def transcribe_audio_modal(
 
 @app.function(
     image=image,
-    volumes={MODEL_CACHE_DIR: volume},
+    volumes={MODEL_CACHE_DIR: model_volume, DATA_ROOT: data_volume},
     gpu="T4",
-    timeout=7200,  # 2 hour timeout for batch processing
+    timeout=7200,
     memory=8192,
 )
 def batch_transcribe_modal(
@@ -129,6 +162,8 @@ def batch_transcribe_modal(
     Returns:
         List of transcription results
     """
+    import whisper  # noqa: F401
+    from vecina_transcriber.transcriber import EnglishTranscriber
     logger.info(
         f"Starting batch transcription of {len(audio_files_data)} files")
 
@@ -187,8 +222,8 @@ def batch_transcribe_modal(
 
 @app.function(
     image=image,
-    volumes={MODEL_CACHE_DIR: volume},
-    timeout=300,  # 5 minute timeout
+    volumes={MODEL_CACHE_DIR: model_volume},
+    timeout=300,
 )
 def get_model_info_modal(model_name: str = "base") -> Dict[str, Any]:
     """
@@ -203,6 +238,7 @@ def get_model_info_modal(model_name: str = "base") -> Dict[str, Any]:
     logger.info(f"Getting info for model {model_name}")
 
     try:
+        from vecina_transcriber.transcriber import EnglishTranscriber
         transcriber = EnglishTranscriber(
             model_name=model_name,
             download_root=MODEL_CACHE_DIR
@@ -226,7 +262,142 @@ def list_available_models_modal() -> List[str]:
     Returns:
         List of available model names
     """
+    from vecina_transcriber.transcriber import EnglishTranscriber
     return EnglishTranscriber.get_available_models()
+
+
+@app.function(
+    image=image,
+    volumes={MODEL_CACHE_DIR: model_volume, DATA_ROOT: data_volume},
+    gpu="T4",
+    timeout=7200,
+    memory=8192,
+)
+def transcribe_all_modal() -> Dict[str, Any]:
+    """Transcribe all audio files in the data volume using config settings."""
+    from vecina_transcriber.transcriber import EnglishTranscriber
+    import whisper  # noqa: F401
+
+    _ensure_dirs()
+    cfg = _load_config()
+    model_name = cfg["model_name"]
+    logger.info(f"Batch transcription start: model={model_name}")
+
+    transcriber = EnglishTranscriber(
+        model_name=model_name,
+        download_root=MODEL_CACHE_DIR,
+        device=None if cfg.get("device") == "auto" else cfg.get("device")
+    )
+
+    audio_exts = {".mp3", ".wav", ".m4a", ".ogg", ".flac"}
+    audio_files = [p for p in Path(AUDIO_DIR).rglob(
+        "*") if p.is_file() and p.suffix.lower() in audio_exts]
+    if not audio_files:
+        logger.warning("No audio files found in volume.")
+        return {"processed": 0, "results": []}
+
+    results: List[Dict[str, Any]] = []
+    for audio_path in audio_files:
+        try:
+            logger.info(f"Transcribing {audio_path.name}")
+            result = transcriber.transcribe(
+                audio=str(audio_path),
+                temperature=cfg.get("temperature", 0.0),
+                word_timestamps=cfg.get("word_timestamps", False),
+                language=cfg.get("language", "en"),
+                verbose=cfg.get("batch_verbose", False)
+            )
+            result.update({
+                "filename": audio_path.name,
+                "model_used": model_name,
+            })
+            # Save outputs
+            base_out = Path(TRANSCRIPTS_DIR) / audio_path.stem
+            if "txt" in cfg.get("formats", []):
+                (base_out.with_suffix(".txt")).write_text(
+                    result["text"], encoding="utf-8")
+            if "json" in cfg.get("formats", []):
+                (base_out.with_suffix(".json")).write_text(json.dumps(
+                    result, ensure_ascii=False, indent=2), encoding="utf-8")
+            results.append({"filename": audio_path.name, "status": "ok"})
+        except Exception as e:
+            logger.error(f"Failed {audio_path.name}: {e}")
+            results.append({"filename": audio_path.name,
+                           "status": "error", "error": str(e)})
+
+    summary = {"processed": len(results), "results": results}
+    Path(TRANSCRIPTS_DIR, "summary.json").write_text(
+        json.dumps(summary, indent=2), encoding="utf-8")
+    logger.info("Batch transcription complete")
+    return summary
+
+
+@app.function(image=image, volumes={DATA_ROOT: data_volume}, timeout=60)
+def list_transcripts() -> Dict[str, Any]:
+    """Web endpoint: list available transcript files."""
+    _ensure_dirs()
+    files = []
+    for p in Path(TRANSCRIPTS_DIR).glob("*.*"):
+        if p.is_file():
+            files.append({"name": p.name, "size": p.stat().st_size})
+    return {"count": len(files), "files": files}
+
+
+@app.function(image=image, volumes={DATA_ROOT: data_volume}, timeout=60)
+def get_transcript(filename: str) -> Dict[str, Any]:
+    """Web endpoint: fetch a specific transcript (json or text)."""
+    _ensure_dirs()
+    target = Path(TRANSCRIPTS_DIR) / filename
+    if not target.exists():
+        return {"error": "not_found", "filename": filename}
+    if target.suffix == ".json":
+        return json.loads(target.read_text(encoding="utf-8"))
+    # Return text wrapped in JSON
+    return {"filename": filename, "text": target.read_text(encoding="utf-8")}
+
+
+# FastAPI ASGI application providing richer endpoints.
+@app.function(image=image, volumes={MODEL_CACHE_DIR: model_volume, DATA_ROOT: data_volume}, timeout=300)
+@modal.asgi_app(requires_proxy_auth=True)
+def api_app():
+    """FastAPI application exposing transcript and batch operations."""
+    from fastapi import FastAPI, HTTPException, Query
+
+    _ensure_dirs()
+    app_fast = FastAPI(title="VECINA Transcriber API", version="0.1.0")
+
+    @app_fast.get("/health")
+    async def health():
+        return {"status": "ok"}
+
+    @app_fast.get("/config")
+    async def get_config():
+        return _load_config()
+
+    @app_fast.get("/transcripts")
+    async def list_transcripts_api():
+        files = []
+        for p in Path(TRANSCRIPTS_DIR).glob("*.*"):
+            if p.is_file():
+                files.append({"name": p.name, "size": p.stat().st_size})
+        return {"count": len(files), "files": files}
+
+    @app_fast.get("/transcripts/{filename}")
+    async def get_transcript_api(filename: str):
+        target = Path(TRANSCRIPTS_DIR) / filename
+        if not target.exists():
+            raise HTTPException(status_code=404, detail="Transcript not found")
+        if target.suffix == ".json":
+            return json.loads(target.read_text(encoding="utf-8"))
+        return {"filename": filename, "text": target.read_text(encoding="utf-8")}
+
+    @app_fast.post("/batch")
+    async def trigger_batch():
+        # Fire synchronous batch transcription in current container
+        summary = transcribe_all_modal.remote()
+        return summary
+
+    return app_fast
 
 
 # Convenience functions for external usage
@@ -311,23 +482,9 @@ def batch_transcribe_with_modal(
 
 
 if __name__ == "__main__":
-    # Example usage when running directly
-    import sys
-
-    if len(sys.argv) < 2:
-        print("Usage: python modal_entrypoint.py <audio_file> [model_name]")
-        sys.exit(1)
-
-    audio_file = sys.argv[1]
-    model_name = sys.argv[2] if len(sys.argv) > 2 else "base"
-
-    print(f"Transcribing {audio_file} using model {model_name} in Modal...")
-
+    # Delegate execution to the primary CLI defined in cli.py
     try:
-        result = transcribe_with_modal(audio_file, model_name)
-        print("\nTranscription completed!")
-        print(f"Text: {result['text'][:200]}...")  # Show first 200 chars
-        print(f"Segments: {len(result['segments'])}")
-    except Exception as e:
-        print(f"Error: {e}")
-        sys.exit(1)
+        from .cli import main as cli_main
+    except ImportError:  # Fallback if relative import fails
+        from vecina_transcriber.cli import main as cli_main
+    cli_main()
