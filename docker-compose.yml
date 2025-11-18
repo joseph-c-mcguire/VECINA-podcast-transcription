@@ -1,0 +1,12 @@
+services:
+  vecina_transcriber:
+    build: .
+    image: vecina_transcriber:latest
+    container_name: vecina_transcriber
+    volumes:
+      - ./_data:/app/_data
+      - ./_output:/app/_output
+    environment:
+      - PYTHONUNBUFFERED=1
+    stdin_open: true
+    tty: true

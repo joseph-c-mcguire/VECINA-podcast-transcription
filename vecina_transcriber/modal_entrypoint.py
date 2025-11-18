@@ -15,7 +15,7 @@ from typing import Any, Dict, List, Optional, Union
 
 import modal
 
-from .transcriber import EnglishTranscriber
+from vecina_transcriber.transcriber import EnglishTranscriber
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -27,6 +27,9 @@ app = modal.App("vecina-transcriber")
 # Define the Modal image with required dependencies
 image = (
     modal.Image.debian_slim(python_version="3.13")
+    .pip_install("openai-whisper torch numpy")
+    .add_local_dir("vecina_transcriber")
+    .add_local_dir("_data")  # Include local module
     .pip_install_from_pyproject("pyproject.toml")
     .apt_install(["ffmpeg"])  # Required for audio processing
 )
