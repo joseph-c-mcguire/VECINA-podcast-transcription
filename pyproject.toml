@@ -40,6 +40,8 @@ dependencies = [
     "whisper (>=1.1.10,<2.0.0)",
     "fastapi[standard]>=0.121.2",
     "modal>=1.2.2",
+    # Added pytest-cov so --cov flags in pytest ini are recognized without requiring dev extras
+    "pytest-cov>=4.0.0",
 ]
 
 [project.optional-dependencies]
@@ -112,7 +114,7 @@ warn_unreachable = true
 strict_equality = true
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["test"]
 python_files = ["test_*.py", "*_test.py"]
 addopts = "-v --cov=vecina_transcriber --cov-report=term-missing"
 
@@ -130,5 +132,8 @@ exclude_lines = [
 
 [dependency-groups]
 dev = [
+    "black>=25.11.0",
+    "isort>=6.1.0",
     "pytest>=8.4.2",
+    "pytest-cov>=7.0.0",
 ]

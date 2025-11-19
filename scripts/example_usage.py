@@ -45,7 +45,7 @@ def example_basic_usage():
         result = transcribe_audio(audio_file, model_name="tiny")
         print(f"Transcription (first 100 chars): {result['text'][:100]}...")
 
-        # Method 2: Using the transcriber class
+        # Method 2: Using the transcriber clas
         print("\nMethod 2: Using transcriber class")
         transcriber = create_transcriber(model_name="tiny")
         result = transcriber.transcribe_file(
